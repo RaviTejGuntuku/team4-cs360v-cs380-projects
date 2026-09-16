@@ -52,8 +52,8 @@ static inline void serial_write(uc_engine *uc, uint64_t offset,
         putchar(value & 0xFF);
     }
     else if (offset == SERIAL_POWEROFF) {
-        vm->exit_code = (int) value; 
-        vm->powered_off = 1;
+        v->exit_code = (int) value; 
+        v->powered_off = 1;
         uc_emu_stop(uc); //stop the CPU
     }
     else {
@@ -78,8 +78,9 @@ static inline bool mem_invalid(uc_engine *uc, uc_mem_type type, uint64_t address
                                int size, int64_t value, void *user_data)
 {
     (void)uc; (void)type; (void)address; (void)size; (void)value; (void)user_data;
-    vm->faulted = 1; 
-    vm->fault_addr = address; 
+    struct vmm *v = user_data;
+    v->faulted = 1; 
+    v->fault_addr = address; 
     //report on stderr
 
     //TODO: can use fprintf here as well, may change bc some given code uses that instead 
@@ -146,9 +147,9 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
      * (size SERIAL_SIZE) with uc_mmio_map, using serial_read / serial_write and
      * `v` as the user_data for both. */
 
-     uc_err err3 = uc_mmio_map(v->uc, SERIAL_BASE, SERIAL_SIZE, serial_read(), v, serial_write(), v);
+     uc_err err3 = uc_mmio_map(v->uc, SERIAL_BASE, SERIAL_SIZE, serial_read, v, serial_write, v);
      if(err3) {
-        fprintf(stderror, "uc_mmio_map: %s \n", uc_strerror(err3));
+        fprintf(stderr, "uc_mmio_map: %s \n", uc_strerror(err3));
         return -1; 
      }
 
@@ -165,12 +166,12 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
      * (size DEV_SIZE) with uc_mmio_map, using vlog_device_mmio_read /
      * vlog_device_mmio_write and v->dev as the user_data for both. */
 
-     uc_mmio_map(v->dev, DEV_BASE, DEV_SIZE, vlog_device_mmio_read(), v, v_log_device_mmio_write(), v);  //TODO: add error handling for other uc actions
+     uc_mmio_map(v->uc, DEV_BASE, DEV_SIZE, vlog_device_mmio_read, v->dev, vlog_device_mmio_write, v->dev);  //TODO: add error handling for other uc actions
 
     /* TODO(student): set the initial stack pointer. RSP goes just below the
      * reserved boot-info region (BOOTINFO_BASE), 16-byte aligned, via
      * uc_reg_write(UC_X86_REG_RSP, ...). The guest needs a stack to run. */
-     uint64_t = rsp = BOOTINFO_BASE - 16; 
+     uint64_t rsp = BOOTINFO_BASE - 16; 
      uc_reg_write(v->uc, UC_X86_REG_RSP, &rsp);
 
     /* provided: boot-parameter pointer. The guest receives BOOTINFO_BASE in
@@ -220,7 +221,8 @@ int vmm_load_binary(struct vmm *v, const char *path)
         fprintf(stderr, "short read loading binary\n");
         return -1;
     }
-    uc_reg_write(v->uc, UC_X86_REG_RIP, RAM_BASE);
+    uint64_t rip = RAM_BASE;
+    uc_reg_write(v->uc, UC_X86_REG_RIP, &rip);
     return 0;
 }
 
