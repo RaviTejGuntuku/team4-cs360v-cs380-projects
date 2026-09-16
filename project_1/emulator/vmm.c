@@ -34,6 +34,7 @@ static inline uint64_t serial_read(uc_engine *uc, uint64_t offset,
     return 0; /* nothing readable */
 }
 
+//handle serial write cases; can write at offset SERIAL_TX or SERIAL_POWEROFF
 static inline void serial_write(uc_engine *uc, uint64_t offset,
                                 unsigned size, uint64_t value, void *user_data)
 {
@@ -46,6 +47,20 @@ static inline void serial_write(uc_engine *uc, uint64_t offset,
      *   - offset SERIAL_POWEROFF: record the exit code (`value`), mark the VM
      *                             powered off, and stop the CPU (uc_emu_stop).
      *   - anything else:          ignore. */
+
+    if(offset == SERIAL_TX) {
+        putchar(value & 0xFF);
+    }
+    else if (offset == SERIAL_POWEROFF) {
+        vm->exit_code = (int) value; 
+        vm->powered_off = 1;
+        uc_emu_stop(uc); //stop the CPU
+    }
+    else {
+        return; 
+    }
+
+
 }
 
 /* ---- Guest memory faults ---------------------------------------------- */
@@ -55,13 +70,23 @@ static inline void serial_write(uc_engine *uc, uint64_t offset,
  * address that is not mapped (no RAM, no MMIO region).
  *   - record the fault in the VMM (v->faulted, v->fault_addr);
  *   - report it on stderr (NOT stdout, which is the guest's console);
- *   - stop the CPU with uc_emu_stop();
+ *   - ;stop the CPU with uc_emu_stop()
  *   - return false, meaning "do not retry the access".
  * `static inline` so it does not warn until you wire it up in vmm_create(). */
+
 static inline bool mem_invalid(uc_engine *uc, uc_mem_type type, uint64_t address,
                                int size, int64_t value, void *user_data)
 {
     (void)uc; (void)type; (void)address; (void)size; (void)value; (void)user_data;
+    vm->faulted = 1; 
+    vm->fault_addr = address; 
+    //report on stderr
+
+    //TODO: can use fprintf here as well, may change bc some given code uses that instead 
+    fputs("Error: Invalid memory access\n", stderr); 
+
+    uc_emu_stop(uc);
+
     return false;
 }
 
@@ -101,9 +126,31 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
      * UC_PROT_ALL) so the device can translate guest addresses to host
      * pointers. Return -1 on failure. */
 
+     v->ram = calloc(1, RAM_SIZE);
+
+     
+     if(!v->ram) {
+        fprintf(stderr, "Issue allocating v->ram  \n");
+        return -1; 
+     }
+
+     uc_err err2 = uc_mem_map_ptr(v->uc, RAM_BASE, RAM_SIZE, UC_PROT_ALL, v->ram);
+
+     if(err2) {
+        fprintf(stderr, "uc_mem_map_ptr: %s\n", uc_strerror(err2));
+        return -1; 
+     }
+
+
     /* TODO(student): register the serial/control MMIO region at SERIAL_BASE
      * (size SERIAL_SIZE) with uc_mmio_map, using serial_read / serial_write and
      * `v` as the user_data for both. */
+
+     uc_err err3 = uc_mmio_map(v->uc, SERIAL_BASE, SERIAL_SIZE, serial_read(), v, serial_write(), v);
+     if(err3) {
+        fprintf(stderror, "uc_mmio_map: %s \n", uc_strerror(err3));
+        return -1; 
+     }
 
     /* provided: allocate and initialize the device instance (its logic lives
      * in device.c) */
@@ -118,9 +165,13 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
      * (size DEV_SIZE) with uc_mmio_map, using vlog_device_mmio_read /
      * vlog_device_mmio_write and v->dev as the user_data for both. */
 
+     uc_mmio_map(v->dev, DEV_BASE, DEV_SIZE, vlog_device_mmio_read(), v, v_log_device_mmio_write(), v);  //TODO: add error handling for other uc actions
+
     /* TODO(student): set the initial stack pointer. RSP goes just below the
      * reserved boot-info region (BOOTINFO_BASE), 16-byte aligned, via
      * uc_reg_write(UC_X86_REG_RSP, ...). The guest needs a stack to run. */
+     uint64_t = rsp = BOOTINFO_BASE - 16; 
+     uc_reg_write(v->uc, UC_X86_REG_RSP, &rsp);
 
     /* provided: boot-parameter pointer. The guest receives BOOTINFO_BASE in
      * RDI (its main()'s first argument). Leave this as-is. */
@@ -147,8 +198,30 @@ int vmm_load_binary(struct vmm *v, const char *path)
     /* TODO(student): read the whole flat binary at `path` into guest RAM
      * starting at v->ram (offset 0 == RAM_BASE), rejecting a file larger than
      * RAM_SIZE, then set the initial RIP to RAM_BASE (the entry point) with
-     * uc_reg_write(UC_X86_REG_RIP, ...). Return 0 on success, -1 on error. */
-    return -1;
+     * uc_reg_write(UC_X86_REG_RIP, ...). Return 0 on success, -1 on error. */\
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen bianry file");
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    uint64_t sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if(sz < 0 || sz > RAM_SIZE) {
+        fprintf(stderr, "binary file too large or unreadable\n");
+        fclose(f);
+        return -1;
+    }
+    size_t n = fread(v->ram, 1, (size_t)sz, f);
+    fclose(f);
+    if (n != (size_t)sz) {
+        fprintf(stderr, "short read loading binary\n");
+        return -1;
+    }
+    uc_reg_write(v->uc, UC_X86_REG_RIP, RAM_BASE);
+    return 0;
 }
 
 /* provided: boot-parameter blob loader (used by the test harness via
@@ -187,7 +260,21 @@ int vmm_run(struct vmm *v)
      *   - if the guest FAULTED (v->faulted), return VMM_EXIT_FAULT;
      *   - a Unicorn error while NOT powered off is a failure (return non-zero);
      *   - otherwise return v->exit_code. */
-    return 1;
+
+    uc_err run_err = uc_emu_start(v->uc, RAM_BASE, 0, 0, 0);
+    //if we are stopped we will end up here
+
+    if(v->faulted) {
+        return VMM_EXIT_FAULT; 
+    }
+
+    if(!v->powered_off && run_err) {
+        //desc says if theres a unicorn error while not powered off... we have a failure (return non zero)
+        return -1; 
+    }
+
+
+    return v->exit_code;
 }
 
 void vmm_destroy(struct vmm *v)
@@ -209,5 +296,26 @@ void *vmm_gpa_to_host(struct vmm *v, uint64_t gpa, uint64_t len)
      * host pointer into v->ram. Return NULL unless the ENTIRE range lies within
      * guest RAM [RAM_BASE, RAM_BASE + RAM_SIZE). Beware integer overflow when
      * checking the upper bound. See SPEC.md Part I, vmm_gpa_to_host. */
-    return NULL;
+
+    uint64_t start = RAM_BASE; 
+    uint64_t end = RAM_BASE + RAM_SIZE; 
+
+    uint64_t w_end = gpa + len;
+
+    //check for overflow
+    if(w_end < len) {
+        return NULL;
+    }
+
+    if(gpa < start) {
+        return NULL; 
+    }
+
+    if(w_end > end) {
+        return NULL; 
+    }
+
+    //translate and return pointer
+
+    return v->ram + (gpa - start);
 }
