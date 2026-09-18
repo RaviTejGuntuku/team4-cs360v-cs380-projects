@@ -74,12 +74,35 @@
 #include "virtq.h"
 
 #include <string.h>
+#include <stdbool.h>
 
 /* ---- (a) guest-physical -> host-virtual -------------------------------- */
 
 void *virtq_gpa_to_hva(const struct virtq_mem *mem, uint64_t gpa, uint64_t len)
 {
-    (void)mem; (void)gpa; (void)len;
+    if (mem == NULL || len == 0)
+        return NULL;
+
+    if (gpa > UINT64_MAX - len)
+        return NULL;
+
+    size_t num_regions = mem->nregions;
+    
+    for (size_t i = 0; i < num_regions; ++i) {
+
+        const struct virtq_mem_region *r = &mem->regions[i];
+
+        if (r->gpa > UINT64_MAX - r->size)
+            continue;
+
+        uint64_t curr_gpa = r->gpa;
+        uint64_t end_gpa = curr_gpa + r->size;
+
+        if (gpa >= curr_gpa && gpa + len <= end_gpa) {
+            return mem->regions[i].hva + (gpa - curr_gpa);  
+        }
+
+    }
 
     /* TODO(student): find the region that fully contains [gpa, gpa+len) and
      * return the host pointer for it; otherwise return NULL. See the notes
@@ -88,13 +111,115 @@ void *virtq_gpa_to_hva(const struct virtq_mem *mem, uint64_t gpa, uint64_t len)
 }
 
 /* ---- (b) the virtqueue ------------------------------------------------- */
+static void append_descriptor(const struct virtq_mem *mem, const struct vring_desc *d, char rec[VIRTQ_MAX_RECORD], uint32_t *rec_len)
+{
+    if (d->len == 0)
+        return;
+
+    const void *src = virtq_gpa_to_hva(mem, d->addr, d->len);
+    if (src == NULL)
+        return;
+
+    uint32_t remaining = VIRTQ_MAX_RECORD - *rec_len;
+    uint32_t amount = d->len;
+
+    if (amount > remaining)
+        amount = remaining;
+
+    if (amount > 0) {
+        memcpy(rec + *rec_len, src, amount);
+        *rec_len += amount;
+    }
+}
+
+static void process_table(const struct vring_desc *table,
+                          uint32_t count,
+                          uint16_t head,
+                          bool allow_indirect,
+                          const struct virtq_mem *mem,
+                          char rec[VIRTQ_MAX_RECORD],
+                          uint32_t *rec_len)
+{
+    uint32_t index = head;
+    uint32_t hops = 0;
+
+    while (index < count && hops < count) {
+        struct vring_desc d = table[index];
+        hops++;
+
+        if (d.flags & VRING_DESC_F_WRITE) {
+            // skip
+        } else if (d.flags & VRING_DESC_F_INDIRECT) {
+            // Indirect descriptors are permitted only in the main table.
+            // An indirect table cannot contain another indirect table.
+            if (!allow_indirect)
+                break;
+
+            if (d.len >= sizeof(struct vring_desc) &&
+                d.len % sizeof(struct vring_desc) == 0) {
+                struct vring_desc *indirect =
+                    virtq_gpa_to_hva(mem, d.addr, d.len);
+
+                if (indirect != NULL) {
+                    uint32_t indirect_count =
+                        d.len / (uint32_t)sizeof(struct vring_desc);
+
+                    process_table(indirect, indirect_count, 0, false, mem, rec, rec_len);
+                }
+            }
+        } else {
+            append_descriptor(mem, &d, rec, rec_len);
+        }
+
+        if (!(d.flags & VRING_DESC_F_NEXT))
+            break;
+
+        if ((uint32_t)d.next >= count)
+            break;
+
+        index = d.next;
+    }
+}
+
 
 int vlog_virtq_handle(struct virtq *vq, const struct virtq_mem *mem,
                       struct vlog_sink *sink)
 {
-    (void)vq; (void)mem; (void)sink;
 
-    /* TODO(student): process every available chain (see the recipe above) and
-     * return how many you completed. */
-    return 0;
+    if (vq == NULL || mem == NULL || sink == NULL || vq->desc == NULL ||
+        vq->avail == NULL || vq->used == NULL || vq->num == 0) {
+        return 0;
+    }
+
+    int completed = 0;
+    uint16_t available = vq->avail->idx;
+    virtq_rmb();
+
+    while (vq->last_avail != available) {
+        char record[VIRTQ_MAX_RECORD];
+
+        uint32_t record_len = 0;
+        uint16_t avail_slot = vq->last_avail % vq->num;
+
+        uint16_t head = vq->avail->ring[avail_slot];
+
+        if (head < vq->num) {
+            process_table(vq->desc, vq->num, head, true, mem, record, &record_len);
+        }
+
+        vlog_sink_emit(sink, record, record_len);
+
+        uint16_t used_slot = vq->used->idx % vq->num;
+
+        vq->used->ring[used_slot].id = head;
+        vq->used->ring[used_slot].len = 0;
+
+        virtq_wmb();
+
+        vq->used->idx++;
+        vq->last_avail++;
+        completed++;
+    }
+
+    return completed;
 }
