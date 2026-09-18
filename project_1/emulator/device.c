@@ -77,7 +77,26 @@ uint64_t vlog_device_mmio_read(uc_engine *uc, uint64_t offset,
     /* TODO(student): return the 32-bit value of the register at `offset`
      * (relative to DEV_BASE): ID, VERSION, STATUS, MSG_LO, MSG_HI, LEN, LEVEL,
      * SEQ. Return 0 for any other offset. See SPEC.md §2. */
-    return 0;
+      switch(offset) {
+        case VLOG_REG_ID:
+          return VLOG_MAGIC; 
+        case VLOG_REG_VERSION:
+          return VLOG_VERSION;
+        case VLOG_REG_STATUS:
+          return dev->status;
+        case VLOG_REG_MSG_LO:
+          return dev->msg_addr_lo;
+        case VLOG_REG_MSG_HI:
+          return dev->msg_addr_hi;
+        case VLOG_REG_LEN:
+          return dev->len;
+        case VLOG_REG_LEVEL:
+          return dev->level;
+        case VLOG_REG_SEQ:
+          return dev->seq;
+        default:
+          return 0;
+      }
 }
 
 void vlog_device_mmio_write(uc_engine *uc, uint64_t offset,
@@ -110,4 +129,85 @@ void vlog_device_mmio_write(uc_engine *uc, uint64_t offset,
      *       other: set_error(VLOG_ERR_BADCMD);
      *   - read-only registers and unknown offsets: ignore the write.
      * See SPEC.md §3 (errors) and §4 (commands). */
+
+     switch(offset) {
+        case VLOG_REG_MSG_LO:
+          dev->msg_addr_lo = value;
+          break;
+        case VLOG_REG_MSG_HI:
+          dev->msg_addr_hi = value;
+          break;
+        case VLOG_REG_LEN:
+          dev->len = value;
+          break;
+        case VLOG_REG_LEVEL:
+          dev->level = value;
+          break;
+        case VLOG_REG_SEQ:
+          //dont write (check if true)
+          break;
+        case VLOG_REG_CMD:
+          switch(value) {
+            case VLOG_CMD_NOP:
+              //dp nothing 
+              clear_error(dev);
+              break; 
+            case VLOG_CMD_LOG: 
+              //validate length
+              if(dev->len > VLOG_MAX_MSG) {
+                clear_error(dev);
+                set_error(dev, VLOG_ERR_BADLEN);
+                break;
+              }
+         
+              void* msg = vmm_gpa_to_host(dev->vmm, msg_addr(dev),dev->len);
+              if(!msg) {
+                clear_error(dev);
+                set_error(dev, VLOG_ERR_BADADDR);
+                break; 
+              }
+              
+              logstore_append(dev->vmm->store, dev->seq, dev->level, msg, dev->len);
+              dev->seq++; 
+              dev->bytes += dev->len; 
+              clear_error(dev);
+              break; 
+              
+            case VLOG_CMD_FLUSH: 
+                logstore_flush(dev->vmm->store);
+                break;
+                
+            case VLOG_CMD_STAT: 
+                if(dev->len < sizeof(struct vlog_stats)) {
+                   clear_error(dev);
+                   set_error(dev, VLOG_ERR_BADLEN);
+                   break;
+                }
+                
+                uint64_t address = msg_addr(dev);
+
+                struct vlog_stats *s = vmm_gpa_to_host(dev->vmm, address, sizeof(struct vlog_stats));
+                
+                if(!s) {
+                  clear_error(dev);
+                  set_error(dev,VLOG_ERR_BADADDR);
+                  break;
+                }
+                
+                s->records = dev->seq; 
+                s->bytes = dev->bytes; 
+                clear_error(dev);
+                break;
+
+            default: 
+                clear_error(dev);
+                set_error(dev, VLOG_ERR_BADCMD);
+                return; 
+          }
+     }
+
+
+          
+          
 }
+       
