@@ -28,11 +28,15 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <net/route.h>
 
 #include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <sys/mount.h>
 
 /* ---- Part I: namespaces ----------------------------------------------- */
 
@@ -41,7 +45,7 @@ int container_namespaces(void)
     /* TODO(student): return the bitwise-OR of CLONE_NEWUSER, CLONE_NEWPID,
      * CLONE_NEWNS, CLONE_NEWUTS and CLONE_NEWNET. Returning 0 gives no
      * isolation at all. */
-    return 0;
+     return CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWNET;
 }
 
 int container_write_idmaps(struct container *c, pid_t child)
@@ -53,6 +57,23 @@ int container_write_idmaps(struct container *c, pid_t child)
      *   /proc/<child>/setgroups   <- "deny"      (required before gid_map)
      *   /proc/<child>/gid_map     <- "0 <your-gid> 1"
      * This maps container id 0 (root) to your real id outside. See getuid(2). */
+    char path[64];
+    char map[64];
+
+    sprintf(path, "/proc/%d/uid_map", (int)child);
+    sprintf(map, "0 %d 1", (int) getuid()); 
+    if (write_file(path, map) < 0)
+        return -1;
+
+    sprintf(path, "/proc/%d/setgroups", (int)child);
+    if (write_file(path, "deny") < 0)
+        return -1;
+
+    sprintf(path, "/proc/%d/gid_map", (int)child);
+    sprintf(map, "0 %d 1", (int) getgid());
+    if (write_file(path, map) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -159,6 +180,118 @@ int container_setup(struct container *c)
      *     syscall filter (do it last of all).
      *
      * Return 0 on success, -1 to abort. */
+     //set hostname 
+    if (sethostname(c->hostname, strlen(c->hostname)) < 0) {
+        perror("sethostname");
+        return -1;
+    }
+
+    container_network(); 
+
+    if(c->net_enabled) {
+        container_net_config(c);
+    }
+
+    //set up part 2: mounted filesystem
+
+    //make mount propagation private 
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        perror("container: mount private /");
+        return -1;
+    }
+
+    //bind the rootfs onto itself
+    if (mount(c->rootfs, c->rootfs, NULL, MS_BIND | MS_REC, NULL) < 0) {
+        perror("container: bind rootfs");
+        return -1;
+    }
+
+    //remount bind  as read-only
+    if (mount(NULL, c->rootfs, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
+        perror("container: remount rootfs read-only");
+        return -1;
+    }
+
+    //mount a writable /tmp
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/tmp", c->rootfs);
+    if (mount("tmpfs", path, "tmpfs", 0, NULL) < 0) {
+        perror("container: mount /tmp");
+        return -1;
+    }
+
+    //mount /dev 
+    snprintf(path, sizeof path, "%s/dev", c->rootfs);
+    if (mount("tmpfs", path, "tmpfs", 0, NULL) < 0) {
+        perror("container: mount /dev");
+        return -1;
+    }
+
+    //create empty files dev/null and dev/zero
+    snprintf(path, sizeof path, "%s/dev/null", c->rootfs);
+    int fd1 = open(path, O_CREAT | O_WRONLY, 0666);
+    if (fd1 < 0) {
+        perror("container: create /dev/null");
+        return -1;
+    }
+    close(fd1);
+
+    snprintf(path, sizeof path, "%s/dev/zero", c->rootfs);
+    int fd2 = open(path, O_CREAT | O_WRONLY, 0666);
+    if (fd2 < 0) {
+        perror("container: create /dev/zero");
+        return -1;
+    }
+    close(fd2);
+
+    //make each empty file show the host's device instead (use bind mount)
+    snprintf(path, sizeof path, "%s/dev/null", c->rootfs);
+    if (mount("/dev/null", path, NULL, MS_BIND, NULL) < 0) {
+        perror("container: bind /dev/null");
+        return -1;
+    }
+
+    snprintf(path, sizeof path, "%s/dev/zero", c->rootfs);
+    if (mount("/dev/zero", path, NULL, MS_BIND, NULL) < 0) {
+        perror("container: bind /dev/zero");
+        return -1;
+    }
+
+    //mount a fresh /proc 
+    snprintf(path, sizeof path, "%s/proc", c->rootfs);
+    if (mount("proc", path, "proc", 0, NULL) < 0) {
+        perror("container: mount /proc");
+        return -1;
+    }
+
+    //switch roots 
+    if (chdir(c->rootfs) < 0) {
+        perror("container: chdir rootfs");
+        return -1;
+    }
+    if (syscall(SYS_pivot_root, ".", ".") < 0) {
+        perror("container: pivot_root");
+        return -1;
+    }
+    if (umount2(".", MNT_DETACH) < 0) {
+        perror("container: detach old root");
+        return -1;
+    }
+    if (chdir("/") < 0) {
+        perror("container: chdir /");
+        return -1;
+    }
+
+
+    
+
+
+
+
+
+
+
+
     for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
         if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0) {
             fprintf(stderr, "container: prctl(PR_CAPBSET_DROP, %d): %s\n",
@@ -199,6 +332,31 @@ int container_network(void)
      * "lo", ioctl(SIOCGIFFLAGS) to read its flags, OR in IFF_UP | IFF_RUNNING,
      * and ioctl(SIOCSIFFLAGS) to set them. Best-effort: this needs CAP_NET_ADMIN,
      * so call it before dropping capabilities. */
+     int fd = socket(AF_INET, SOCK_DGRAM, 0);
+     if (fd < 0) {
+         perror("socket");
+         return 0; 
+     }
+     struct ifreq ifr; 
+     memset(&ifr, 0, sizeof(ifr));
+ 
+     strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+ 
+     if(ioctl(fd, SIOCGIFFLAGS, &ifr) < 0) {
+         perror("SIOCGIFFLAGS");
+         close(fd);
+         return 0;
+     }
+ 
+     ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+ 
+     if(ioctl(fd, SIOCSIFFLAGS, &ifr) < 0) {
+         perror("SIOCSIFFLAGS");
+         close(fd);
+         return 0;
+     }
+
+     close(fd);
     return 0;
 }
 
@@ -215,6 +373,51 @@ int container_net_config(struct container *c)
      *     (rt_dst/rt_genmask 0.0.0.0, rt_gateway = c->net_gw,
      *     rt_flags = RTF_UP | RTF_GATEWAY) and ioctl(SIOCADDRT).
      * Needs CAP_NET_ADMIN, so container_setup() calls this before the cap drop. */
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if(fd < 0) {
+        return -1; 
+    }
+
+    struct ifreq ifr;
+    struct sockaddr_in *sin; 
+    
+    //ip addr
+    memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, c->net_ifname, IFNAMSIZ - 1);
+    sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    sin->sin_family = AF_INET; 
+    inet_pton(AF_INET, c->net_ip, &sin->sin_addr);
+    ioctl(fd, SIOCSIFADDR, &ifr);
+
+    //netmask 
+    memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, c->net_ifname, IFNAMSIZ - 1);
+    sin = (struct sockaddr_in *)&ifr.ifr_netmask; 
+    sin->sin_family = AF_INET; 
+    sin->sin_addr.s_addr = htonl(~0u << (32 -c->net_prefix));
+    ioctl(fd, SIOCSIFNETMASK, &ifr);
+
+    //flags
+    memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, c->net_ifname, IFNAMSIZ - 1);
+    ioctl(fd, SIOCGIFFLAGS, &ifr);
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING; 
+    ioctl(fd, SIOCSIFFLAGS, &ifr);
+
+    //default route via net gateway 
+    struct rtentry rt;
+    memset(&rt, 0, sizeof rt);
+    ((struct sockaddr_in *)&rt.rt_dst)->sin_family = AF_INET;
+    ((struct sockaddr_in *)&rt.rt_genmask)->sin_family = AF_INET;
+    sin = (struct sockaddr_in *)&rt.rt_gateway;
+    sin->sin_family = AF_INET;
+    inet_pton(AF_INET, c->net_gw, &sin->sin_addr);
+    rt.rt_flags = RTF_UP | RTF_GATEWAY;
+    ioctl(fd, SIOCADDRT, &rt);
+    
+    close(fd);    
+
+    
     return 0;
 }
 
