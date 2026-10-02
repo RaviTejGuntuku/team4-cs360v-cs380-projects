@@ -308,6 +308,11 @@ int container_init(struct container *c)
     }
 }
 
+static int container_clone_trampoline(void *arg)
+{
+    return container_init((struct container *)arg);
+}
+
 /* ---- the whole lifecycle: main.c calls only this ----------------------- */
 
 int container_run(struct container *c)
@@ -349,7 +354,7 @@ int container_run(struct container *c)
     }
 
     char stack[CONTAINER_STACK_SIZE];
-    pid_t child = clone(container_init, stack + CONTAINER_STACK_SIZE,
+    pid_t child = clone(container_clone_trampoline, stack + CONTAINER_STACK_SIZE,
                         container_namespaces() | SIGCHLD, c);
     if (child < 0) {
         fprintf(stderr, "container: clone(): %s\n", strerror(errno));
