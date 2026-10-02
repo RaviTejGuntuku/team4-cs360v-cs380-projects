@@ -71,6 +71,44 @@ int container_cgroup_init(struct container *c)
      *     <cg_path>/memory.max (a value < 0 means the literal string "max"), and
      *     write "0" to <cg_path>/memory.swap.max so hitting the memory cap
      *     OOM-kills instead of swapping. */
+    char filepath[256];
+    // Write to subtree file
+    snprintf(filepath, sizeof(filepath), "%s/cgroup.subtree_control", c->cgroup_base);
+    write_file(filepath, "+pids +memory");
+
+    // Filepath now groupbase/name
+    snprintf(filepath, sizeof(filepath), "%s/%s", c->cgroup_base, c->name);
+    // Mkdir with name
+    // TODO: I dont understand the wording they used for EEXIST
+    if(syscall(SYS_mkdir, filepath, 0777) == EEXIST) {
+
+    }
+
+    // Copy name to cgpath
+    strcpy(c->cg_path, filepath);
+
+    char string_holder[128];
+
+    // Write to pids.max
+    snprintf(filepath, sizeof(filepath), "%s/pids.max", c->cg_path);
+    // Copy num to string_holder
+    snprintf(string_holder, sizeof(string_holder), "%d", c->pids_max); 
+    write_file(filepath, string_holder);
+    
+    // Write to memory.max
+    snprintf(filepath, sizeof(filepath), "%s/memory.max", c->cg_path);
+    if(c->mem_max >= 0) {
+        snprintf(string_holder, sizeof(string_holder), "%d", c->mem_max); 
+        write_file(filepath, string_holder);
+    } else {
+        snprintf(string_holder, sizeof(string_holder), "max"); 
+        write_file(filepath, string_holder);
+    }
+
+    // Write to memory.swap.max
+    snprintf(filepath, sizeof(filepath), "%s/memory.swap.max", c->cg_path);
+    snprintf(string_holder, sizeof(string_holder), "0"); 
+    write_file(filepath, string_holder);
     return 0;
 }
 
