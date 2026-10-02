@@ -24,6 +24,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stddef.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+
+#include <linux/audit.h>
+#include <linux/capability.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 /* ---- Part I: namespaces ----------------------------------------------- */
 
@@ -112,6 +121,35 @@ int container_setup(struct container *c)
      *     syscall filter (do it last of all).
      *
      * Return 0 on success, -1 to abort. */
+    for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
+        if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0) {
+            fprintf(stderr, "container: prctl(PR_CAPBSET_DROP, %d): %s\n",
+                    cap, strerror(errno));
+            return -1;
+        }
+    }
+
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3,
+        .pid = 0,
+    };
+    struct __user_cap_data_struct data[2] = {{0}, {0}};
+
+    if (syscall(SYS_capset, &hdr, data) != 0) {
+        fprintf(stderr, "container: capset(): %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+        fprintf(stderr, "container: prctl(PR_SET_NO_NEW_PRIVS): %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    if (container_seccomp() < 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -144,25 +182,74 @@ int container_net_config(struct container *c)
 
 int container_seccomp(void)
 {
-    /* TODO(student) Part III: install a seccomp-BPF filter that blocks a
-     * denylist of dangerous syscalls (ptrace, mount, umount2, pivot_root,
-     * chroot, setns, unshare, reboot, swapon/swapoff, kexec_load, and the
-     * *_module calls) by returning EPERM, and allows everything else.
-     *
-     * Build a `struct sock_filter[]` with <linux/filter.h> / <linux/seccomp.h>:
-     *   1. load seccomp_data.arch and reject a foreign ABI (compare against
-     *      AUDIT_ARCH_X86_64 or AUDIT_ARCH_AARCH64 for your build arch);
-     *   2. load seccomp_data.nr and, for each denied __NR_*, return
-     *      SECCOMP_RET_ERRNO | EPERM;
-     *   3. otherwise return SECCOMP_RET_ALLOW.
-     * Then prctl(PR_SET_NO_NEW_PRIVS, 1, ...) and
-     * syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog). */
+    /* Deny dangerous syscalls by returning EPERM, while allowing every other
+     * call. The filter also rejects any syscall coming from a foreign CPU ABI.
+     */
+    int arch;
+#if defined(__x86_64__)
+    arch = AUDIT_ARCH_X86_64;
+#elif defined(__aarch64__)
+    arch = AUDIT_ARCH_AARCH64;
+#else
+# error "Unsupported build architecture for seccomp filter"
+#endif
+
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, arch, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ptrace, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mount, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_umount2, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pivot_root, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_chroot, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setns, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unshare, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_reboot, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_swapon, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_swapoff, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_kexec_load, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_init_module, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_finit_module, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_delete_module, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    struct sock_fprog prog = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
+        fprintf(stderr, "container: seccomp filter install failed: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
     return 0;
 }
 
 int container_init(struct container *c)
 {
-    (void)c;
+
     /* TODO(student) Part IV: this is the container's init, PID 1 in a fresh PID
      * namespace. It runs in the cloned child. Do, in order:
      *   1. wait for the parent to release you: close c->sync[1], then read one
@@ -175,14 +262,56 @@ int container_init(struct container *c)
      *      included). Stop when the command itself is reaped; return its exit
      *      status (WEXITSTATUS, or 128+signal if it was killed).
      * The value you return here is what the container exits with. */
-    return 0;
+    
+    char ch;
+
+    close(c->sync[1]);
+    if (read(c->sync[0], &ch, 1) != 1) {
+        fprintf(stderr, "container: failed to read sync byte\n");
+        return 1;
+    }
+    close(c->sync[0]);
+
+    if (container_setup(c) < 0) {
+        return 1;
+    }
+
+    pid_t cmd_pid = fork();
+    if (cmd_pid < 0) {
+        fprintf(stderr, "container: fork(): %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (cmd_pid == 0) {
+        execvp(c->argv[0], c->argv);
+        fprintf(stderr, "container: execvp(%s): %s\n", c->argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    while (1) {
+        int st;
+        pid_t pid = waitpid(-1, &st, 0);
+        if (pid < 0) {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "container: waitpid(): %s\n", strerror(errno));
+            return 1;
+        }
+
+        if (pid == cmd_pid) {
+            if (WIFEXITED(st))
+                return WEXITSTATUS(st);
+            if (WIFSIGNALED(st))
+                return 128 + WTERMSIG(st);
+            return 1;
+        }
+    }
 }
 
 /* ---- the whole lifecycle: main.c calls only this ----------------------- */
 
 int container_run(struct container *c)
 {
-    (void)c;
     /* TODO(student): drive the container's whole lifecycle and return the
      * command's exit status. In order:
      *   1. container_cgroup_init(c)                      (Part V);
@@ -208,18 +337,80 @@ int container_run(struct container *c)
 
     /* Keep the "container: " prefix on anything you print here: the test
      * harness reads the container's output and skips lines starting with it. */
-    fprintf(stderr, "container: container_run() is not implemented yet, "
-                    "so nothing ran. See SPEC.md.\n");
-    return 1;
+    if (!c)
+        return 1;
+
+    if (container_cgroup_init(c) < 0)
+        return 1;
+
+    if (pipe(c->sync) < 0) {
+        fprintf(stderr, "container: pipe(): %s\n", strerror(errno));
+        return 1;
+    }
+
+    char stack[CONTAINER_STACK_SIZE];
+    pid_t child = clone(container_init, stack + CONTAINER_STACK_SIZE,
+                        container_namespaces() | SIGCHLD, c);
+    if (child < 0) {
+        fprintf(stderr, "container: clone(): %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (container_write_idmaps(c, child) < 0)
+        return 1;
+
+    if (container_cgroup_enter(c, child) < 0)
+        return 1;
+
+    if (c->net_enabled && container_net_host_setup(c, child) < 0)
+        return 1;
+
+    close(c->sync[0]);
+    if (write(c->sync[1], "x", 1) != 1) {
+        fprintf(stderr, "container: write(sync): %s\n", strerror(errno));
+        close(c->sync[1]);
+        return 1;
+    }
+    close(c->sync[1]);
+
+    int st = 0;
+    if (waitpid(child, &st, 0) < 0) {
+        fprintf(stderr, "container: waitpid(child): %s\n", strerror(errno));
+        return 1;
+    }
+
+    int status = 0;
+    if (WIFEXITED(st))
+        status = WEXITSTATUS(st);
+    else if (WIFSIGNALED(st))
+        status = 128 + WTERMSIG(st);
+    else
+        status = 1;
+
+    if (c->net_enabled)
+        container_net_host_teardown(c);
+
+    if (container_cleanup(c) < 0)
+        return 1;
+
+    return status & 0xff;
 }
 
 /* ---- Part VI: teardown ------------------------------------------------- */
 
 int container_cleanup(struct container *c)
 {
-    (void)c;
-    /* TODO(student): the child (and its whole subtree) is already reaped, so its
-     * cgroup is empty and its mount namespace is gone. Remove the cgroup
-     * directory you created (rmdir c->cg_path). Tolerate it already being gone. */
+    if (!c)
+        return 0;
+
+    if (c->cg_path[0] == '\0')
+        return 0;
+    
+    if (rmdir(c->cg_path) < 0 && errno != ENOENT) {
+        fprintf(stderr, "container: rmdir(%s): %s\n", c->cg_path,
+                strerror(errno));
+        return -1;
+    }
+
     return 0;
 }
