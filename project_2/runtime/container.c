@@ -25,6 +25,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stddef.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -81,7 +84,6 @@ int container_write_idmaps(struct container *c, pid_t child)
 
 int container_cgroup_init(struct container *c)
 {
-    (void)c;
     /* TODO(student): create this container's cgroup and set its limits (SPEC
      * Part V):
      *   - enable the controllers you need in the BASE cgroup's subtree_control:
@@ -92,52 +94,66 @@ int container_cgroup_init(struct container *c)
      *     <cg_path>/memory.max (a value < 0 means the literal string "max"), and
      *     write "0" to <cg_path>/memory.swap.max so hitting the memory cap
      *     OOM-kills instead of swapping. */
-    char filepath[256];
-    // Write to subtree file
-    snprintf(filepath, sizeof(filepath), "%s/cgroup.subtree_control", c->cgroup_base);
-    write_file(filepath, "+pids +memory");
+    char path[PATH_MAX];
+    char value[64];
+    int n;
 
-    // Filepath now groupbase/name
-    snprintf(filepath, sizeof(filepath), "%s/%s", c->cgroup_base, c->name);
-    // Mkdir with name
-    // TODO: I dont understand the wording they used for EEXIST
-    if(syscall(SYS_mkdir, filepath, 0777) == EEXIST) {
+    n = snprintf(path, sizeof path, "%s/cgroup.subtree_control",
+                 c->cgroup_base);
+    if (n < 0 || (size_t)n >= sizeof path || write_file(path, "+pids +memory") < 0)
+        return -1;
 
+    n = snprintf(c->cg_path, sizeof c->cg_path, "%s/%s",
+                 c->cgroup_base, c->name);
+    if (n < 0 || (size_t)n >= sizeof c->cg_path) {
+        fprintf(stderr, "container: cgroup path is too long\n");
+        c->cg_path[0] = '\0';
+        return -1;
     }
 
-    // Copy name to cgpath
-    strcpy(c->cg_path, filepath);
-
-    char string_holder[128];
-
-    // Write to pids.max
-    snprintf(filepath, sizeof(filepath), "%s/pids.max", c->cg_path);
-    // Copy num to string_holder
-    snprintf(string_holder, sizeof(string_holder), "%d", c->pids_max); 
-    write_file(filepath, string_holder);
-    
-    // Write to memory.max
-    snprintf(filepath, sizeof(filepath), "%s/memory.max", c->cg_path);
-    if(c->mem_max >= 0) {
-        snprintf(string_holder, sizeof(string_holder), "%d", c->mem_max); 
-        write_file(filepath, string_holder);
-    } else {
-        snprintf(string_holder, sizeof(string_holder), "max"); 
-        write_file(filepath, string_holder);
+    if (mkdir(c->cg_path, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "container: mkdir(%s): %s\n", c->cg_path,
+                strerror(errno));
+        c->cg_path[0] = '\0';
+        return -1;
     }
 
-    // Write to memory.swap.max
-    snprintf(filepath, sizeof(filepath), "%s/memory.swap.max", c->cg_path);
-    snprintf(string_holder, sizeof(string_holder), "0"); 
-    write_file(filepath, string_holder);
+    n = snprintf(path, sizeof path, "%s/pids.max", c->cg_path);
+    if (n < 0 || (size_t)n >= sizeof path ||
+        snprintf(value, sizeof value, "%ld", c->pids_max) < 0 ||
+        write_file(path, value) < 0)
+        return -1;
+
+    n = snprintf(path, sizeof path, "%s/memory.max", c->cg_path);
+    if (n < 0 || (size_t)n >= sizeof path)
+        return -1;
+    if (c->mem_max < 0) {
+        strcpy(value, "max");
+    } else if (snprintf(value, sizeof value, "%ld", c->mem_max) < 0) {
+        return -1;
+    }
+    if (write_file(path, value) < 0)
+        return -1;
+
+    n = snprintf(path, sizeof path, "%s/memory.swap.max", c->cg_path);
+    if (n < 0 || (size_t)n >= sizeof path || write_file(path, "0") < 0)
+        return -1;
+
     return 0;
 }
 
 int container_cgroup_enter(struct container *c, pid_t child)
 {
-    (void)c; (void)child;
     /* TODO(student): move `child` into this container's cgroup by writing its
      * pid to <cg_path>/cgroup.procs. */
+    char path[PATH_MAX];
+    char pid[32];
+    int n = snprintf(path, sizeof path, "%s/cgroup.procs", c->cg_path);
+    if (n < 0 || (size_t)n >= sizeof path ||
+        snprintf(pid, sizeof pid, "%ld", (long)child) < 0 ||
+        write_file(path, pid) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -281,16 +297,6 @@ int container_setup(struct container *c)
         perror("container: chdir /");
         return -1;
     }
-
-
-    
-
-
-
-
-
-
-
 
     for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
         if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0) {
