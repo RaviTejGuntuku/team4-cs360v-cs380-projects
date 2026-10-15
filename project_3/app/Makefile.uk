@@ -8,7 +8,7 @@
 #
 # TODO(student) A: register this application and add runner.c.
 #
-#     $(eval $(call addlib,apprunner))
+$(eval $(call addlib,apprunner))
 #
 #   The name you pass defines the variables you use next: `apprunner` gives you
 #   APPRUNNER_BASE (this directory) and APPRUNNER_SRCS-y (its sources).
@@ -16,7 +16,8 @@
 #   runner.c is NOT in this directory and must NOT be copied here: it is in
 #   runner/, one level up. Express its path relative to APPRUNNER_BASE:
 #
-#     APPRUNNER_SRCS-y += $(APPRUNNER_BASE)/../runner/runner.c
+APPRUNNER_SRCS-y += $(APPRUNNER_BASE)/../runner/runner.c
+
 #
 # TODO(student) B (SPEC Part III): register your statistics library as a SECOND
 #   library.
