@@ -41,8 +41,8 @@ targets:
 #       CONFIG_LWIP_DHCP=y         take an address from QEMU's DHCP server
 #       CONFIG_LWIP_SOCKET_PPOLL=n
 #
-# libraries:
-lwip:
+libraries:
+  lwip:
     version: stable
     kconfig:
       - CONFIG_LWIP_UKNETDEV=y
