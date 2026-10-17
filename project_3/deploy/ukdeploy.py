@@ -32,6 +32,7 @@ import os
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -412,8 +413,73 @@ def cmd_bench(args):
 
     If you put cmd_deploy's steps 5 to 7 in a helper function, call it here
     instead of copying them."""
-    print("TODO: implement bench")
-    return 1
+    img = find_image(args.arch)
+    if img is None:
+        print("run `ukdeploy.py build` first", file=sys.stderr)
+        return 1
+    if args.count <= 0:
+        print("count must be positive", file=sys.stderr)
+        return 1
+
+    spec = ARCHES[args.arch]
+    times = []
+
+    for run in range(args.count):
+        port = pick_port(load_state())
+        if port is None:
+            print("no free ports available", file=sys.stderr)
+            return 1
+
+        argv = [spec["qemu"], "-kernel", img, "-nographic", "-no-reboot",
+                "-m", "128M"]
+        if (args.arch == host_arch()
+                and os.access("/dev/kvm", os.R_OK | os.W_OK)):
+            argv.extend(["-enable-kvm", "-cpu", spec["cpu"]])
+        else:
+            argv.extend(["-cpu", spec["fallback_cpu"]])
+        argv.extend(spec.get("extra", []))
+        argv.extend(["-netdev", f"user,id=n0,hostfwd=tcp::{port}-:{RUNNER_PORT}",
+                     "-device", "virtio-net-pci,netdev=n0"])
+
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, f"bench-{run + 1}.log")
+        started = time.time()
+        log = None
+        proc = None
+        try:
+            log = open(log_path, "wb")
+            proc = subprocess.Popen(argv, stdout=log,
+                                    stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+            log.close()
+            log = None
+
+            if not wait_ready(port, proc.pid):
+                print(f"instance failed to become ready; see {log_path}",
+                      file=sys.stderr)
+                return 1
+            times.append(time.time() - started)
+        except OSError as error:
+            print(f"failed to start QEMU: {error}", file=sys.stderr)
+            return 1
+        finally:
+            if log is not None and not log.closed:
+                log.close()
+            if proc is not None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+
+    times.sort()
+    print(f"image      {img}")
+    print(f"image_size {os.path.getsize(img)}")
+    print(f"runs       {args.count}")
+    print(f"ready_p50  {statistics.median(times)}")
+    print(f"ready_max  {times[-1]}")
+    return 0
 
 
 def cmd_list(args):

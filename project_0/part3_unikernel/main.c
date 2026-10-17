@@ -12,8 +12,7 @@
 
 int main(void)
 {
-    /* TODO(student): print  __DATE__  and  __TIME__  on one line, e.g.
-     *   printf("%s %s\n", __DATE__, __TIME__);
-     */
+    // TODO(student): print  __DATE__  and  __TIME__  on one line, e.g.
+    printf("%s %s\n", __DATE__, __TIME__);
     return 0;
 }

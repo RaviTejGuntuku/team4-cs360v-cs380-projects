@@ -25,9 +25,7 @@ int main(void)
     if (err) { fprintf(stderr, "uc_emu_start: %s\n", uc_strerror(err)); return 1; }
 
     int eax = 0;
-    /* TODO(student): read the EAX register into `eax`.
-     *   uc_reg_read(uc, UC_X86_REG_EAX, &eax);
-     */
+    uc_reg_read(uc, UC_X86_REG_EAX, &eax);
 
     uc_close(uc);
     printf("%d\n", eax);
