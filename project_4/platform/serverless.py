@@ -189,18 +189,39 @@ class Platform:
             (201, {"name": name, "function": function}).
 
         Hold self.lock while you use self.registry."""
-        return 500, {"error": "deploy not implemented"}
+        if name == "": 
+            return 400, {"error":f"function name is empty"}
+        
+        if function == "":
+            function = name
+
+        with self.lock:
+            if name in self.registry: 
+                return 409, {"error":f"{name} is already registered"}
+            self.registry[name] = {"function":function, "created":time.time()}
+            self._save_registry()
+        
+        return 201, {"name": name, "function": function}
 
     def list_functions(self):
         """TODO(student) Part I: return a list of the registered functions, each a
         dict with "name", "function" and "created". The registry stores the name
         only as the key, so add "name" to each dict. Hold self.lock."""
-        return []
-
+        functions = []
+        with self.lock: 
+            for name in self.registry.keys():
+                functions.append({"name": name, "function": self.registry[name]["function"], "created": self.registry[name]["created"]})
+        return functions
+    
     def lookup(self, name):
         """TODO(student) Part I: return the function's dict, including its "name",
         or None if it is not registered. Hold self.lock."""
-        return None
+        with self.lock: 
+            entry = self.registry.get(name)
+            if entry is None: 
+                return None
+            return {"name": name, "function": entry["function"], "created": entry["created"]}
+        
 
     # ---- health checks and backend status: what you implement ---------
 
@@ -217,7 +238,27 @@ class Platform:
              self.FAIL_THRESHOLD.
 
         Change b["up"], b["fails"] and b["funcs"] while holding self.lock."""
-        pass
+        try: 
+            reply = runner_call(b["host"], b["port"], "PING", 1.5)
+            if reply == "PONG":
+                store = runner_call(b["host"], b["port"], "FUNCS", 1.5)
+                store = store.split()
+                with self.lock:
+                    b["funcs"] = set(store[1:len(store)])
+                    b["fails"] = 0
+                    b["up"] = True
+            else:
+                with self.lock:
+                    b["fails"] += 1
+                    if b["fails"] >= self.FAIL_THRESHOLD:
+                        b["up"] = False
+        except OSError: 
+            with self.lock:
+                b["fails"] += 1
+                if b["fails"] >= self.FAIL_THRESHOLD:
+                    b["up"] = False
+
+
 
     def backends_status(self):
         """TODO(student) Part II: for GET /backends, return a list with one
@@ -225,7 +266,12 @@ class Platform:
         "outstanding", "invocations", "errors", and "avg_latency_ms"
         (latency_sum / invocations, in milliseconds; 0 if there are no
         invocations). Hold self.lock."""
-        return []
+        result = []
+        with self.lock: 
+            for b in self.backends: 
+                result.append({"backend": f"{b['host']}:{b['port']}", "up": b["up"], "outstanding": b["outstanding"], "invocations": b["invocations"], "errors": b["errors"], "funcs": sorted(b["funcs"]), "avg_latency_ms": b["latency_sum"] / b["invocations"] * 1000 if b["invocations"] else 0})
+        
+        return result
 
     def _note_failure(self, b):
         """PROVIDED: call this when a request to `b` fails. No more requests go
