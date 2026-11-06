@@ -33,6 +33,7 @@ Run:  serverless.py --port 8000 --backend 127.0.0.1:9001 --backend ... \
                     --registry /tmp/registry.json
 """
 import argparse
+import copy
 import json
 import os
 import shlex
@@ -189,39 +190,35 @@ class Platform:
             (201, {"name": name, "function": function}).
 
         Hold self.lock while you use self.registry."""
-        if name == "": 
-            return 400, {"error":f"function name is empty"}
-        
-        if function == "":
+        if not name:
+            return 400, {"error": "function name is empty"}
+        if not function:
             function = name
 
         with self.lock:
-            if name in self.registry: 
-                return 409, {"error":f"{name} is already registered"}
-            self.registry[name] = {"function":function, "created":time.time()}
+            if name in self.registry:
+                return 409, {"error": f"{name} is already registered"}
+            self.registry[name] = {"function": function, "created": time.time()}
             self._save_registry()
-        
         return 201, {"name": name, "function": function}
 
     def list_functions(self):
         """TODO(student) Part I: return a list of the registered functions, each a
         dict with "name", "function" and "created". The registry stores the name
         only as the key, so add "name" to each dict. Hold self.lock."""
-        functions = []
-        with self.lock: 
-            for name in self.registry.keys():
-                functions.append({"name": name, "function": self.registry[name]["function"], "created": self.registry[name]["created"]})
-        return functions
-    
+        with self.lock:
+            out = [{"name": name, "function": entry["function"], "created": entry["created"]}
+                   for name, entry in sorted(self.registry.items())]
+        return out
+
     def lookup(self, name):
         """TODO(student) Part I: return the function's dict, including its "name",
         or None if it is not registered. Hold self.lock."""
-        with self.lock: 
+        with self.lock:
             entry = self.registry.get(name)
-            if entry is None: 
+            if entry is None:
                 return None
             return {"name": name, "function": entry["function"], "created": entry["created"]}
-        
 
     # ---- health checks and backend status: what you implement ---------
 
@@ -238,27 +235,25 @@ class Platform:
              self.FAIL_THRESHOLD.
 
         Change b["up"], b["fails"] and b["funcs"] while holding self.lock."""
-        try: 
+        try:
             reply = runner_call(b["host"], b["port"], "PING", 1.5)
-            if reply == "PONG":
-                store = runner_call(b["host"], b["port"], "FUNCS", 1.5)
-                store = store.split()
-                with self.lock:
-                    b["funcs"] = set(store[1:len(store)])
-                    b["fails"] = 0
-                    b["up"] = True
-            else:
-                with self.lock:
-                    b["fails"] += 1
-                    if b["fails"] >= self.FAIL_THRESHOLD:
-                        b["up"] = False
-        except OSError: 
+            if reply != "PONG":
+                raise OSError("not pong")
+            funcs_reply = runner_call(b["host"], b["port"], "FUNCS", 1.5)
+            toks = funcs_reply.split()
+            if not toks or toks[0] != "OK":
+                raise OSError("not funcs")
+            with self.lock:
+                b["funcs"] = set(toks[1:])
+                b["fails"] = 0
+                b["up"] = True
+            return
+        except (OSError, socket.timeout):
             with self.lock:
                 b["fails"] += 1
                 if b["fails"] >= self.FAIL_THRESHOLD:
                     b["up"] = False
-
-
+                    b["funcs"] = set()
 
     def backends_status(self):
         """TODO(student) Part II: for GET /backends, return a list with one
@@ -267,10 +262,20 @@ class Platform:
         (latency_sum / invocations, in milliseconds; 0 if there are no
         invocations). Hold self.lock."""
         result = []
-        with self.lock: 
-            for b in self.backends: 
-                result.append({"backend": f"{b['host']}:{b['port']}", "up": b["up"], "outstanding": b["outstanding"], "invocations": b["invocations"], "errors": b["errors"], "funcs": sorted(b["funcs"]), "avg_latency_ms": b["latency_sum"] / b["invocations"] * 1000 if b["invocations"] else 0})
-        
+        with self.lock:
+            for b in self.backends:
+                avg = 0.0
+                if b["invocations"]:
+                    avg = (b["latency_sum"] / b["invocations"]) * 1000.0
+                result.append({
+                    "backend": f"{b['host']}:{b['port']}",
+                    "up": b["up"],
+                    "funcs": sorted(b["funcs"]),
+                    "outstanding": b["outstanding"],
+                    "invocations": b["invocations"],
+                    "errors": b["errors"],
+                    "avg_latency_ms": avg,
+                })
         return result
 
     def _note_failure(self, b):
@@ -288,10 +293,11 @@ class Platform:
 
         Do everything inside `with self.slot_free:` (it also holds self.lock).
 
-          1. A backend can be used if b["up"] is true, `function` is in
-             b["funcs"], and b["outstanding"] < self.MAX_OUTSTANDING.
-          2. Pick the one with the lowest b["outstanding"]. If several tie, pick
-             the one with the lowest b["invocations"].
+          1. A backend can be used if it is up, has `function` in
+             b["funcs"], and has fewer than `MAX_OUTSTANDING` requests in progress.
+          2. Pick the one with the fewest requests in progress. If several tie,
+             pick the one that has served the fewest requests so far
+             (`b["invocations"]`).
           3. Add 1 to its b["outstanding"] and return it.
           4. If no backend that is up has `function` at all, return None.
           5. Otherwise they are all full. Wait for a slot with
@@ -301,31 +307,31 @@ class Platform:
 
         Do not call lookup() or anything else that takes self.lock in here: you
         already hold it, and taking it a second time hangs forever."""
-        
         with self.slot_free:
-            while time.monotonic() < deadline:
-                backend = None
-                exists = False
+            while True:
+                if time.monotonic() >= deadline:
+                    return "timeout"
+                best = None
+                seen_any = False
                 for b in self.backends:
-                    if b["up"] and function in b["funcs"]:
-                        exists = True
-                        # Pick backend with smallest outstanding/invocations
-                        if (b["outstanding"] < self.MAX_OUTSTANDING and 
-                            (backend == None or
-                            b["outstanding"] < backend["outstanding"] or
-                            (b["outstanding"] == backend["outstanding"] and b["invocations"] < backend["invocations"])
-                            )):
-                            backend = b
-                if not exists:
+                    if not b["up"] or function not in b["funcs"]:
+                        continue
+                    seen_any = True
+                    if b["outstanding"] >= self.MAX_OUTSTANDING:
+                        continue
+                    if best is None or b["outstanding"] < best["outstanding"] or (
+                        b["outstanding"] == best["outstanding"] and b["invocations"] < best["invocations"]
+                    ):
+                        best = b
+                if not seen_any:
                     return None
-                if backend:
-                    backend["outstanding"] += 1
-                    return backend
-
-                self.slot_free.wait(timeout=deadline - time.monotonic())
-            
-
-        return "timeout"
+                if best is not None:
+                    best["outstanding"] += 1
+                    return best
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "timeout"
+                self.slot_free.wait(timeout=remaining)
 
     def _release(self, b):
         """TODO(student) Part III: give back the slot _acquire took. Inside
@@ -424,20 +430,41 @@ class Platform:
                - shed = rejected + no_backend (from self.metrics_data);
                - invocations = self.metrics_data["invocations"];
                - whether any backend has b["outstanding"] > 0;
-               - the backends with b["dynamic"] true.
-          2. After releasing the lock:
-               - If shed > self._last_shed and there are fewer than
-                 self.max_backends backends, call self._spawn_backend().
-               - The tick is idle if invocations == self._last_invocations and
-                 no backend has requests in progress. Add 1 to self._idle_ticks
-                 if it is idle, otherwise set it to 0. Once it reaches
-                 self.SCALE_DOWN_TICKS and there are more than self.min_backends
-                 backends, call self._reap_backend() on a dynamic backend.
-               - Save shed in self._last_shed and invocations in
+               - the backends autoscaling started (b["dynamic"] is true).
+          2. After releasing the lock, decide:
+               - Start a backend if shed went up since the last tick
+                 (self._last_shed) and there are fewer than self.max_backends
+                 backends.
+               - Stop a backend after SCALE_DOWN_TICKS (3) idle ticks in a row.
+                 A tick is idle if invocations has not changed since the last
+                 tick and no request is in progress. Count idle ticks in
+                 self._idle_ticks, and set it back to 0 on a tick that is not
+                 idle. Stop one backend autoscaling started, and only if there are
+                 more than self.min_backends.
+               - Save shed and invocations in self._last_shed and
                  self._last_invocations for the next tick.
 
         Never start or stop processes yourself."""
-        pass
+        with self.lock:
+            shed = self.metrics_data["rejected"] + self.metrics_data["no_backend"]
+            invocations = self.metrics_data["invocations"]
+            requests_in_progress = any(b["outstanding"] > 0 for b in self.backends)
+            dynamic_backends = [b for b in self.backends if b.get("dynamic")]
+
+        if shed > self._last_shed and len(self.backends) < self.max_backends:
+            self._spawn_backend()
+
+        idle = invocations == self._last_invocations and not requests_in_progress
+        if idle:
+            self._idle_ticks += 1
+            if self._idle_ticks >= self.SCALE_DOWN_TICKS and len(self.backends) > self.min_backends and dynamic_backends:
+                self._reap_backend(dynamic_backends[-1])
+                self._idle_ticks = 0
+        else:
+            self._idle_ticks = 0
+
+        self._last_shed = shed
+        self._last_invocations = invocations
 
     # ---- invocation: what you implement -------------------------------
 
@@ -460,8 +487,8 @@ class Platform:
                c. Handle the result:
                     - reply starts with "OK": add 1 to "successes", add the time
                       taken to b["latency_sum"] and 1 to b["invocations"], and
-                      return (200, {"result": reply[3:].strip(),
-                      "backend": f"{b['host']}:{b['port']}"}).
+                      return (200, {"result": ..., "backend": "host:port"}),
+                      where result is the reply without "OK ".
                     - reply starts with "ERR": add 1 to "errors" and
                       b["errors"], and return 400 with the message. Do not try
                       another backend.
@@ -474,45 +501,70 @@ class Platform:
         Catch socket.timeout before OSError: socket.timeout is a kind of
         OSError. Hold self.lock whenever you change a counter."""
         entry = self.lookup(name)
-        if entry == None:
-            return 404
-        self.metrics_data["invocations"] += 1
-        self.metrics_data["by_function"][name] += 1
+        if entry is None:
+            return 404, {"error": "not found"}
+        function = entry["function"]
+        with self.lock:
+            self.metrics_data["invocations"] += 1
+            self.metrics_data["by_function"].setdefault(name, 0)
+            self.metrics_data["by_function"][name] += 1
 
         deadline = time.monotonic() + self.invoke_timeout
-
         while time.monotonic() < deadline:
-            b = self._acquire(name, deadline)
-            if b == None:
-                self.metrics_data["no_backend"] += 1   
-                return 503
-            elif b == "timeout":
-                self.metrics_data["rejected"] += 1
-                return 503
-            func_call_str = "RUN " + name + " " + payload
+            b = self._acquire(function, deadline)
+            if b is None:
+                with self.lock:
+                    self.metrics_data["no_backend"] += 1
+                return 503, {"error": "no backend available"}
+            if b == "timeout":
+                with self.lock:
+                    self.metrics_data["rejected"] += 1
+                return 503, {"error": "backend busy"}
+
+            cmd = f"RUN {function} {payload}"
+            start = time.monotonic()
             try:
-                reply = runner_call(b["host"], b["port"], func_call_str, max(deadline-time.monotonic(), 0.05))
+                reply = runner_call(b["host"], b["port"], cmd, max(deadline - time.monotonic(), 0.05))
+            except socket.timeout:
+                with self.lock:
+                    self.metrics_data["timeouts"] += 1
+                    b["errors"] += 1
+                self._note_failure(b)
                 self._release(b)
-                if reply.startswith("OK"):
+                return 504, {"error": "backend timed out"}
+            except OSError:
+                with self.lock:
+                    b["errors"] += 1
+                self._note_failure(b)
+                self._release(b)
+                continue
+            finally:
+                if 'reply' not in locals():
+                    pass
+
+            self._release(b)
+            if reply.startswith("OK"):
+                elapsed = time.monotonic() - start
+                with self.lock:
                     self.metrics_data["successes"] += 1
-                    b["latency_sum"] += time.monotonic() - (deadline - self.invoke_timeout)
+                    b["latency_sum"] += elapsed
                     b["invocations"] += 1
-                    return (200, {"result": reply[3:].strip(), "backend": f"{b['host']}:{b['port']}"})
-                elif reply.startswith("ERR"):
+                return 200, {"result": reply[3:].strip(), "backend": f"{b['host']}:{b['port']}"}
+            if reply.startswith("ERR"):
+                msg = reply[4:].strip() if len(reply) > 4 else "function error"
+                with self.lock:
                     self.metrics_data["errors"] += 1
                     b["errors"] += 1
-                    return 400
-            except socket.timeout:
-                self.metrics_data["timeouts"] += 1
-                b["errors"] += 1
-                self._note_failure(b)
-                return 504
-            except OSError:
-                b["errors"] += 1
-                self._note_failure(b)
+                return 400, {"error": msg}
 
-        self.metrics_data["errors"] += 1
-        return 502
+            with self.lock:
+                self.metrics_data["errors"] += 1
+                b["errors"] += 1
+            return 400, {"error": "unexpected backend reply"}
+
+        with self.lock:
+            self.metrics_data["errors"] += 1
+        return 502, {"error": "deadline exceeded"}
 
     # ---- metrics: what you implement ----------------------------------
 
@@ -522,7 +574,10 @@ class Platform:
         self.backends_status() (Part II).
         Copy while holding self.lock, but call backends_status() after releasing
         it: it takes the lock itself, and self.lock cannot be taken twice."""
-        return {}
+        with self.lock:
+            copied_metrics = copy.deepcopy(self.metrics_data)
+        copied_metrics["backends"] = self.backends_status()
+        return copied_metrics
 
 
 # ======================================================================
