@@ -310,14 +310,11 @@ class Platform:
                     if b["up"] and function in b["funcs"]:
                         exists = True
                         # Pick backend with smallest outstanding/invocations
-                        if (
-                            b["outstanding"] < self.MAX_OUTSTANDING and 
-                            (
-                            backend == None or
+                        if (b["outstanding"] < self.MAX_OUTSTANDING and 
+                            (backend == None or
                             b["outstanding"] < backend["outstanding"] or
                             (b["outstanding"] == backend["outstanding"] and b["invocations"] < backend["invocations"])
-                            )
-                            ):
+                            )):
                             backend = b
                 if not exists:
                     return None
@@ -492,7 +489,7 @@ class Platform:
             elif b == "timeout":
                 self.metrics_data["rejected"] += 1
                 return 503
-            func_call_str = "RUN " + "name " + payload
+            func_call_str = "RUN " + name + " " + payload
             try:
                 reply = runner_call(b["host"], b["port"], func_call_str, max(deadline-time.monotonic(), 0.05))
                 self._release(b)
