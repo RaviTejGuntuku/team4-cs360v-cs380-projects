@@ -301,13 +301,42 @@ class Platform:
 
         Do not call lookup() or anything else that takes self.lock in here: you
         already hold it, and taking it a second time hangs forever."""
-        return None
+        
+        with self.slot_free:
+            while time.monotonic() < deadline:
+                backend = None
+                exists = False
+                for b in self.backends:
+                    if b["up"] and function in b["funcs"]:
+                        exists = True
+                        # Pick backend with smallest outstanding/invocations
+                        if (
+                            b["outstanding"] < self.MAX_OUTSTANDING and 
+                            (
+                            backend == None or
+                            b["outstanding"] < backend["outstanding"] or
+                            (b["outstanding"] == backend["outstanding"] and b["invocations"] < backend["invocations"])
+                            )
+                            ):
+                            backend = b
+                if not exists:
+                    return None
+                if backend:
+                    backend["outstanding"] += 1
+                    return backend
+
+                self.slot_free.wait(timeout=deadline - time.monotonic())
+            
+
+        return "timeout"
 
     def _release(self, b):
         """TODO(student) Part III: give back the slot _acquire took. Inside
         `with self.slot_free:`, subtract 1 from b["outstanding"] and wake one
         waiting request with self.slot_free.notify()."""
-        pass
+        with self.slot_free:
+            b["outstanding"] -= 1
+            self.slot_free.notify()
 
     # ---- autoscaling --------------------------------------------------
     #
@@ -447,7 +476,46 @@ class Platform:
 
         Catch socket.timeout before OSError: socket.timeout is a kind of
         OSError. Hold self.lock whenever you change a counter."""
-        return 500, {"error": "invoke not implemented"}
+        entry = self.lookup(name)
+        if entry == None:
+            return 404
+        self.metrics_data["invocations"] += 1
+        self.metrics_data["by_function"][name] += 1
+
+        deadline = time.monotonic() + self.invoke_timeout
+
+        while time.monotonic() < deadline:
+            b = self._acquire(name, deadline)
+            if b == None:
+                self.metrics_data["no_backend"] += 1   
+                return 503
+            elif b == "timeout":
+                self.metrics_data["rejected"] += 1
+                return 503
+            func_call_str = "RUN " + "name " + payload
+            try:
+                reply = runner_call(b["host"], b["port"], func_call_str, max(deadline-time.monotonic(), 0.05))
+                self._release(b)
+                if reply.startswith("OK"):
+                    self.metrics_data["successes"] += 1
+                    b["latency_sum"] += time.monotonic() - (deadline - self.invoke_timeout)
+                    b["invocations"] += 1
+                    return (200, {"result": reply[3:].strip(), "backend": f"{b['host']}:{b['port']}"})
+                elif reply.startswith("ERR"):
+                    self.metrics_data["errors"] += 1
+                    b["errors"] += 1
+                    return 400
+            except socket.timeout:
+                self.metrics_data["timeouts"] += 1
+                b["errors"] += 1
+                self._note_failure(b)
+                return 504
+            except OSError:
+                b["errors"] += 1
+                self._note_failure(b)
+
+        self.metrics_data["errors"] += 1
+        return 502
 
     # ---- metrics: what you implement ----------------------------------
 
